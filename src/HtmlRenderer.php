@@ -672,6 +672,7 @@ class HtmlRenderer {
 
     foreach ($rows as $ri => $row) {
       $cells = $row['cells'] ?? [];
+      $link_spans = $row['linkSpans'] ?? [];
       $cell_tag = ($ri === 0) ? 'th' : 'td';
 
       if ($ri === 0) {
@@ -683,7 +684,12 @@ class HtmlRenderer {
 
       $html .= '<tr>';
       foreach ($cells as $cell_text) {
-        $escaped = htmlspecialchars(trim($cell_text), ENT_QUOTES, 'UTF-8');
+        // Apply annotation-based link spans before escaping. A span only
+        // matches inside the cell that contains its display text.
+        $cell_text = $this->applyLinkSpans(trim($cell_text), $link_spans);
+        $escaped = htmlspecialchars($cell_text, ENT_QUOTES, 'UTF-8');
+        $escaped = $this->autoLinkUrls($escaped);
+        $escaped = $this->restoreAnchorTags($escaped);
         $html .= '<' . $cell_tag . '>' . $escaped . '</' . $cell_tag . '>';
       }
       $html .= "</tr>\n";
