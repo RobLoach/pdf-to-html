@@ -200,6 +200,7 @@ class PdfToHtml {
             'isItalic' => $font_line['isItalic'],
             'color' => $font_line['color'],
             'tag' => $font_line['tag'] ?? '',
+            'linkSpans' => $font_line['linkSpans'] ?? [],
             'tableId' => $table_info['tableId'],
             'yPos' => $font_line['yPos'],
           ];
