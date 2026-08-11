@@ -107,6 +107,7 @@ class TableDetector {
         'y' => $y_line['y'],
         'numCols' => count($columns),
         'colStarts' => $col_starts,
+        'segXs' => array_map(fn($s) => $s['x'], $segments),
         'isMultiCol' => (count($columns) >= 2 && !$is_bullet_line),
       ];
     }
@@ -421,12 +422,65 @@ class TableDetector {
     }
     $avg_starts = array_map(fn($sum) => round($sum / count($lines)), $col_start_sums);
 
+    // Refine: a column boundary the primary gap threshold missed exists
+    // where every row has an aligned segment start (e.g. columns only
+    // 80pt apart). Only used when it yields more columns.
+    $refined = $this->refineColumnStarts($lines);
+    if (count($refined) > $num_cols) {
+      $num_cols = count($refined);
+      $avg_starts = $refined;
+    }
+
     return [
       'tableId' => $table_id,
       'yValues' => array_map(fn($l) => $l['y'], $lines),
       'numCols' => $num_cols,
       'colStarts' => $avg_starts,
     ];
+  }
+
+  /**
+   * Find column start X-positions present in every row of a region.
+   *
+   * Clusters all segment start positions across rows (10pt tolerance)
+   * and keeps clusters that appear in every row. Catches real columns
+   * whose gap is below the primary clustering threshold.
+   *
+   * @param array $lines
+   *   Line info records with 'segXs' arrays.
+   *
+   * @return array
+   *   Sorted column start X-positions found in every row.
+   */
+  protected function refineColumnStarts(array $lines): array {
+    $clusters = [];
+    foreach ($lines as $ri => $line) {
+      foreach ($line['segXs'] ?? [] as $x) {
+        $found = FALSE;
+        foreach ($clusters as &$cluster) {
+          if (abs($x - $cluster['sum'] / $cluster['count']) <= 10) {
+            $cluster['sum'] += $x;
+            $cluster['count']++;
+            $cluster['rows'][$ri] = TRUE;
+            $found = TRUE;
+            break;
+          }
+        }
+        unset($cluster);
+        if (!$found) {
+          $clusters[] = ['sum' => $x, 'count' => 1, 'rows' => [$ri => TRUE]];
+        }
+      }
+    }
+
+    $starts = [];
+    foreach ($clusters as $cluster) {
+      if (count($cluster['rows']) === count($lines)) {
+        $starts[] = round($cluster['sum'] / $cluster['count']);
+      }
+    }
+    sort($starts);
+    return $starts;
   }
 
   /**

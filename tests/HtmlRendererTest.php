@@ -112,14 +112,16 @@ class HtmlRendererTest extends TestCase {
     $this->assertStringContainsString('<li>Second step</li>', $html);
   }
 
-  public function testSkipsPageNumbersAndFootnotes(): void {
+  public function testSkipsPageNumbersButKeepsSmallText(): void {
     $html = $this->renderer->buildHtml([
       $this->line('Body text of the page.'),
       $this->line('3'),
       $this->line('Tiny footnote', 9.0),
     ], 12.0);
 
-    $this->assertSame('<p>Body text of the page.</p>', $html);
+    $this->assertStringContainsString('<p>Body text of the page.</p>', $html);
+    $this->assertStringNotContainsString('>3<', $html);
+    $this->assertStringContainsString('<p style="font-size: 9pt">Tiny footnote</p>', $html);
   }
 
   public function testAutoLinksBareUrls(): void {
@@ -172,6 +174,44 @@ class HtmlRendererTest extends TestCase {
     $this->assertStringContainsString('<th>Name</th><th>Age</th>', $html);
     $this->assertStringContainsString('<tbody>', $html);
     $this->assertStringContainsString('<td>Alice</td><td>42</td>', $html);
+  }
+
+  public function testSplitsParagraphsOnLargeLineGap(): void {
+    $html = $this->renderer->buildHtml([
+      $this->line('First paragraph line one.', 12.0, ['yPos' => 700]),
+      $this->line('First paragraph line two.', 12.0, ['yPos' => 680]),
+      $this->line('First paragraph line three.', 12.0, ['yPos' => 660]),
+      $this->line('Second paragraph after a large gap.', 12.0, ['yPos' => 620]),
+    ], 12.0);
+
+    $this->assertSame(
+      "<p>First paragraph line one.<br>First paragraph line two.<br>First paragraph line three.</p>\n"
+      . '<p>Second paragraph after a large gap.</p>',
+      $html
+    );
+  }
+
+  public function testRendersMonospaceLinesAsCodeBlock(): void {
+    $html = $this->renderer->buildHtml([
+      $this->line('drush en my_module', 12.0, ['isMono' => TRUE]),
+      $this->line('drush cr', 12.0, ['isMono' => TRUE]),
+    ], 12.0);
+
+    $this->assertSame("<pre><code>drush en my_module\ndrush cr</code></pre>", $html);
+  }
+
+  public function testAppliesInlineStyleSpans(): void {
+    $html = $this->renderer->buildHtml([
+      $this->line('Mixing bolded text and italic words here.', 12.0, [
+        'styleSpans' => [
+          ['text' => 'bolded text', 'bold' => TRUE, 'italic' => FALSE],
+          ['text' => 'italic words', 'bold' => FALSE, 'italic' => TRUE],
+        ],
+      ]),
+    ], 12.0);
+
+    $this->assertStringContainsString('<strong>bolded text</strong>', $html);
+    $this->assertStringContainsString('<em>italic words</em>', $html);
   }
 
   public function testAppliesInlineStylesForDifferingColor(): void {

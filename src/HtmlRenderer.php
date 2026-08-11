@@ -73,14 +73,6 @@ class HtmlRenderer {
         continue;
       }
 
-      // Skip likely footnotes: short text with font size significantly
-      // smaller than body text (below 85% of body size).
-      if ($font_size > 0 && $body_size > 0
-        && ($font_size / $body_size) < 0.85
-        && mb_strlen($text) < 60) {
-        continue;
-      }
-
       $heading_level = $this->styleAnalyzer->detectHeadingLevel($font_size, $body_size);
       $color = $line['color'] ?? NULL;
       $link_spans = $line['linkSpans'] ?? [];
@@ -168,12 +160,37 @@ class HtmlRenderer {
         'headingLevel' => $heading_level,
         'isBold' => $line['isBold'] ?? FALSE,
         'isItalic' => $line['isItalic'] ?? FALSE,
+        'isMono' => $line['isMono'] ?? FALSE,
         'fontSize' => $font_size,
         'color' => $color,
         'listType' => $list_type,
         'isSubItem' => $is_sub_item,
         'linkSpans' => $link_spans,
+        'styleSpans' => $line['styleSpans'] ?? [],
+        'yPos' => $line['yPos'] ?? 0,
       ];
+    }
+
+    // Detect the typical line gap (mode of successive Y-gaps, smallest
+    // on ties). A gap much larger than one line height marks a paragraph
+    // break rather than a wrapped line.
+    $gap_counts = [];
+    $prev_y = NULL;
+    foreach ($classified as $item) {
+      if ($item === NULL || isset($item['type']) || ($item['yPos'] ?? 0) == 0) {
+        $prev_y = NULL;
+        continue;
+      }
+      if ($prev_y !== NULL && $prev_y > $item['yPos']) {
+        $gap = (int) round($prev_y - $item['yPos']);
+        $gap_counts[$gap] = ($gap_counts[$gap] ?? 0) + 1;
+      }
+      $prev_y = $item['yPos'];
+    }
+    $line_gap = 0.0;
+    if (!empty($gap_counts)) {
+      $max_count = max($gap_counts);
+      $line_gap = (float) min(array_keys(array_filter($gap_counts, fn($n) => $n === $max_count)));
     }
 
     // Build output blocks: merge consecutive body lines into paragraphs,
@@ -255,6 +272,12 @@ class HtmlRenderer {
               $item['linkSpans']
             );
           }
+          if (!empty($item['styleSpans'])) {
+            $current['items'][$last_idx]['styleSpans'] = array_merge(
+              $current['items'][$last_idx]['styleSpans'] ?? [],
+              $item['styleSpans']
+            );
+          }
           continue;
         }
       }
@@ -265,13 +288,22 @@ class HtmlRenderer {
       $key = $item['headingLevel'] . '|'
         . ($item['isBold'] ? '1' : '0') . '|'
         . ($item['isItalic'] ? '1' : '0') . '|'
+        . (($item['isMono'] ?? FALSE) ? '1' : '0') . '|'
         . $item['fontSize'] . '|'
         . $color_key;
 
-      if ($current !== NULL && $current['blockType'] === 'text' && $current['key'] === $key && $item['headingLevel'] === 0) {
+      // A Y-gap well above one line height means a new paragraph.
+      $is_para_break = $line_gap > 0
+        && ($current['lastY'] ?? 0) > 0 && ($item['yPos'] ?? 0) > 0
+        && ($current['lastY'] - $item['yPos']) > $line_gap * 1.5;
+
+      if ($current !== NULL && $current['blockType'] === 'text' && $current['key'] === $key
+        && $item['headingLevel'] === 0 && !$is_para_break) {
         $current['lines'][] = $item['text'];
+        $current['lastY'] = $item['yPos'] ?? 0;
         // Merge linkSpans from continuation lines.
         $current['linkSpans'] = array_merge($current['linkSpans'] ?? [], $item['linkSpans'] ?? []);
+        $current['styleSpans'] = array_merge($current['styleSpans'] ?? [], $item['styleSpans'] ?? []);
       }
       else {
         if ($current !== NULL) {
@@ -284,9 +316,12 @@ class HtmlRenderer {
           'headingLevel' => $item['headingLevel'],
           'isBold' => $item['isBold'],
           'isItalic' => $item['isItalic'],
+          'isMono' => $item['isMono'] ?? FALSE,
           'fontSize' => $item['fontSize'],
           'color' => $item['color'],
           'linkSpans' => $item['linkSpans'] ?? [],
+          'styleSpans' => $item['styleSpans'] ?? [],
+          'lastY' => $item['yPos'] ?? 0,
         ];
       }
     }
@@ -311,10 +346,19 @@ class HtmlRenderer {
         continue;
       }
 
+      // Monospace-font block: render as a code block.
+      if (!empty($block['isMono']) && $block['headingLevel'] === 0) {
+        $html .= '<pre><code>'
+          . htmlspecialchars(implode("\n", $block['lines']), ENT_QUOTES, 'UTF-8')
+          . '</code></pre>' . "\n";
+        continue;
+      }
+
       // Regular text/heading block.
       $inner_html = $this->renderTextLines(
         $block['lines'],
-        $block['linkSpans'] ?? []
+        $block['linkSpans'] ?? [],
+        $block['styleSpans'] ?? []
       );
 
       // Apply inline bold/italic.
@@ -435,15 +479,18 @@ class HtmlRenderer {
    *   Array of text line strings.
    * @param array $link_spans
    *   Link span records with 'text' and 'uri' keys.
+   * @param array $style_spans
+   *   Style span records with 'text', 'bold' and 'italic' keys.
    *
    * @return string
    *   HTML with <br> between lines, linked text wrapped in <a> tags.
    */
-  protected function renderTextLines(array $lines, array $link_spans = []): string {
+  protected function renderTextLines(array $lines, array $link_spans = [], array $style_spans = []): string {
     $full_text = implode("\n", $lines);
 
     // Apply annotation-based link spans first.
     $full_text = $this->applyLinkSpans($full_text, $link_spans);
+    $full_text = $this->applyStyleSpans($full_text, $style_spans);
 
     // Split back to lines and process each.
     $parts = explode("\n", $full_text);
@@ -516,6 +563,43 @@ class HtmlRenderer {
   }
 
   /**
+   * Apply inline bold/italic spans to text by matching display text.
+   *
+   * Wraps matched runs with temporary markers that survive HTML escaping,
+   * using the same space-insensitive matching as applyLinkSpans().
+   *
+   * @param string $text
+   *   The raw text content.
+   * @param array $style_spans
+   *   Style span records with 'text', 'bold' and 'italic' keys.
+   *
+   * @return string
+   *   Text with style markers inserted (pre-HTML-escaping).
+   */
+  protected function applyStyleSpans(string $text, array $style_spans): string {
+    foreach ($style_spans as $span) {
+      $span_text = preg_replace('/\s+/u', '', $span['text'] ?? '');
+      if ($span_text === '' || mb_strlen($span_text) < 2) {
+        continue;
+      }
+
+      $chars = preg_split('//u', $span_text, -1, PREG_SPLIT_NO_EMPTY);
+      $pattern = '/(' . implode('\s*', array_map(fn($c) => preg_quote($c, '/'), $chars)) . ')/u';
+      $tags = (!empty($span['bold']) ? 'b' : '') . (!empty($span['italic']) ? 'i' : '');
+      if ($tags === '') {
+        continue;
+      }
+
+      if (preg_match($pattern, $text, $m, PREG_OFFSET_CAPTURE)) {
+        $replacement = '{{STYLE_START:' . $tags . '}}' . $m[1][0] . '{{STYLE_END}}';
+        $text = substr_replace($text, $replacement, $m[1][1], strlen($m[1][0]));
+      }
+    }
+
+    return $text;
+  }
+
+  /**
    * Restore anchor tags from temporary markers after HTML escaping.
    *
    * @param string $html
@@ -526,13 +610,29 @@ class HtmlRenderer {
    */
   protected function restoreAnchorTags(string $html): string {
     // The markers were HTML-escaped, so match the escaped versions.
-    return preg_replace_callback(
+    $html = preg_replace_callback(
       '/\{\{LINK_START:([A-Za-z0-9+\/=]+)\}\}(.*?)\{\{LINK_END\}\}/s',
       function ($m) {
         $uri = base64_decode($m[1]);
         $display = $m[2];
         $href = htmlspecialchars($uri, ENT_QUOTES, 'UTF-8');
         return '<a href="' . $href . '">' . $display . '</a>';
+      },
+      $html
+    );
+
+    // Restore inline bold/italic markers from applyStyleSpans().
+    return preg_replace_callback(
+      '/\{\{STYLE_START:(b?i?)\}\}(.*?)\{\{STYLE_END\}\}/s',
+      function ($m) {
+        $inner = $m[2];
+        if (str_contains($m[1], 'i')) {
+          $inner = '<em>' . $inner . '</em>';
+        }
+        if (str_contains($m[1], 'b')) {
+          $inner = '<strong>' . $inner . '</strong>';
+        }
+        return $inner;
       },
       $html
     );
@@ -564,6 +664,7 @@ class HtmlRenderer {
       $text = $item['listText'] ?? $item['text'];
       // Apply annotation-based link spans before escaping.
       $text = $this->applyLinkSpans($text, $item['linkSpans'] ?? []);
+      $text = $this->applyStyleSpans($text, $item['styleSpans'] ?? []);
       $escaped = htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
       $escaped = $this->autoLinkUrls($escaped);
       $escaped = $this->restoreAnchorTags($escaped);
@@ -581,6 +682,7 @@ class HtmlRenderer {
         foreach ($sub_items as $sub) {
           $sub_text = $sub['listText'] ?? $sub['text'];
           $sub_text = $this->applyLinkSpans($sub_text, $sub['linkSpans'] ?? []);
+          $sub_text = $this->applyStyleSpans($sub_text, $sub['styleSpans'] ?? []);
           $sub_escaped = htmlspecialchars($sub_text, ENT_QUOTES, 'UTF-8');
           $sub_escaped = $this->autoLinkUrls($sub_escaped);
           $sub_escaped = $this->restoreAnchorTags($sub_escaped);

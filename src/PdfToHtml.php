@@ -120,6 +120,12 @@ class PdfToHtml {
       $fonts = $meta_pages[$pi]->getFonts();
       $data_tm = $meta_pages[$pi]->getDataTm();
       $segment_count = count($data_tm);
+      // Sort segments into visual reading order (Y descending, X
+      // ascending): some PDFs emit list markers after all item text in
+      // the content stream. uasort() preserves keys, keeping the
+      // association with segment_colors (indexed by stream order) intact.
+      uasort($data_tm, fn($a, $b) => (round((float) $b[0][5]) <=> round((float) $a[0][5]))
+        ?: ((float) $a[0][4] <=> (float) $b[0][4]));
       $segment_colors = $this->extractSegmentColors($meta_pages[$pi], $segment_count);
       $page_links = $this->linkExtractor->extractPageLinks($meta_pages[$pi]);
       $table_regions = $this->tableDetector->detectTableRegions($data_tm);
@@ -268,6 +274,13 @@ class PdfToHtml {
           continue;
         }
 
+        // Skip standalone list-marker lines: some PDFs emit all bullet
+        // and number glyphs as separate trailing text runs. The markers
+        // are re-attached to their items from the font line columns.
+        if (preg_match('/^\s*(?:[●•◦▪▸►○■◆➤]|\d{1,3}[.)])\s*$/u', $text)) {
+          continue;
+        }
+
         // Skip getText() lines that are duplicates of table row content.
         // Only skip if the entire text line is contained within a table
         // row signature (or vice versa), preventing false matches from
@@ -347,6 +360,7 @@ class PdfToHtml {
           'fontSize' => 0,
           'isBold' => FALSE,
           'isItalic' => FALSE,
+          'isMono' => FALSE,
           'color' => NULL,
           'tag' => '',
           'yPos' => 0,
@@ -374,14 +388,52 @@ class PdfToHtml {
           $min_fi++;
         }
 
+        // Re-attach a list marker when the matched font line starts with
+        // a bullet/number segment that getText() emitted separately.
+        $text_out = trim($text);
+        $first_seg = NULL;
+        foreach ($font_props['columns'] as $seg) {
+          if (empty($seg['isSpace'])) {
+            $first_seg = trim($seg['text'] ?? '');
+            break;
+          }
+        }
+        if ($first_seg !== NULL && $text_out !== ''
+          && preg_match('/^(?:[●•◦▪▸►○■◆➤]|\d{1,3}[.)])$/u', $first_seg)
+          && !str_starts_with($text_out, $first_seg)) {
+          $text_out = $first_seg . ' ' . $text_out;
+        }
+
+        // Collect inline bold/italic runs from segments whose font
+        // differs from the line-dominant style.
+        $style_spans = [];
+        foreach ($font_props['columns'] as $seg) {
+          if (!empty($seg['isSpace'])) {
+            continue;
+          }
+          $seg_font = strtolower($seg['fontName'] ?? '');
+          $seg_bold = str_contains($seg_font, 'bold') && !$font_props['isBold'];
+          $seg_italic = (str_contains($seg_font, 'italic') || str_contains($seg_font, 'oblique'))
+            && !$font_props['isItalic'];
+          if ($seg_bold || $seg_italic) {
+            $style_spans[] = [
+              'text' => trim($seg['text'] ?? ''),
+              'bold' => $seg_bold,
+              'italic' => $seg_italic,
+            ];
+          }
+        }
+
         $page_lines[] = [
-          'text' => trim($text),
+          'text' => $text_out,
           'fontSize' => $font_props['fontSize'],
           'isBold' => $font_props['isBold'],
           'isItalic' => $font_props['isItalic'],
+          'isMono' => $font_props['isMono'] ?? FALSE,
           'color' => $font_props['color'],
           'tag' => $font_props['tag'] ?? '',
           'linkSpans' => $font_props['linkSpans'] ?? [],
+          'styleSpans' => $style_spans,
           'yPos' => $font_props['yPos'] ?? 0,
         ];
       }
@@ -389,23 +441,23 @@ class PdfToHtml {
       // PHASE 4: Insert table entries at the correct document position.
       // Text lines from getText() are already in correct reading order,
       // so we keep that order and insert table entries at the position
-      // where the table's minimum Y falls relative to text line Y values.
-      // We find the last text line whose yPos is <= the table's first
-      // row yPos and insert the table entries after it.
+      // where the table's top falls relative to text line Y values.
+      // PDF Y grows upward, so the table's first row has the largest
+      // yPos, and lines above the table have an even larger yPos.
       if (!empty($table_entries)) {
-        // Get the Y of the first table row.
-        $table_min_y = PHP_INT_MAX;
+        // Get the Y of the first (topmost) table row.
+        $table_top_y = -PHP_FLOAT_MAX;
         foreach ($table_entries as $entry) {
-          if ($entry['yPos'] < $table_min_y) {
-            $table_min_y = $entry['yPos'];
+          if ($entry['yPos'] > $table_top_y) {
+            $table_top_y = $entry['yPos'];
           }
         }
 
         // Find the insertion index: the position after the last text
-        // line whose yPos is less than the table's first row.
+        // line positioned above the table's top.
         $insert_idx = 0;
         foreach ($page_lines as $idx => $line) {
-          if ($line['yPos'] > 0 && $line['yPos'] < $table_min_y) {
+          if ($line['yPos'] > $table_top_y) {
             $insert_idx = $idx + 1;
           }
         }
@@ -776,6 +828,7 @@ class PdfToHtml {
     $dominant_size = 0;
     $bold_chars = 0;
     $italic_chars = 0;
+    $mono_chars = 0;
     $total_chars = 0;
     $color_counts = [];
     $tag_counts = [];
@@ -794,6 +847,9 @@ class PdfToHtml {
       }
       if (str_contains($name, 'italic') || str_contains($name, 'oblique')) {
         $italic_chars += $chars;
+      }
+      if (str_contains($name, 'mono') || str_contains($name, 'courier')) {
+        $mono_chars += $chars;
       }
 
       // Track color by character count.
@@ -830,6 +886,7 @@ class PdfToHtml {
       'fontSize' => $dominant_size,
       'isBold' => ($total_chars > 0 && $bold_chars > $total_chars / 2),
       'isItalic' => ($total_chars > 0 && $italic_chars > $total_chars / 2),
+      'isMono' => ($total_chars > 0 && $mono_chars > $total_chars / 2),
       'color' => $dominant_color,
       'tag' => $dominant_tag,
     ];
